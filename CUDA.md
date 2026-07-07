@@ -45,6 +45,79 @@ Occupancy = 实际活跃 Warp 数 / SM 最大 Warp 数。先保证没有寄存�
 First cuda file to run.
 Add two vectors.
 
+```
+#include <stdio.h>
+#include <cuda_runtime.h>
+
+#define CUDA_CHECK(call) do { \
+    cudaError_t err = call; \
+    if (err != cudaSuccess) { \
+        fprintf(stderr, "CUDA error at %s:%d: %s\n", \
+                __FILE__, __LINE__, cudaGetErrorString(err)); \
+        exit(EXIT_FAILURE); \
+    } \
+} while(0)
+
+// 核函数：向量加法
+__global__ void vectorAdd(const float* a, const float* b, float* c, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        c[idx] = a[idx] + b[idx];
+    }
+}
+
+int main() {
+    const int N = 1 << 20;  // 1M 元素
+    size_t bytes = N * sizeof(float);
+
+    // 分配主机内存并初始化
+    float* h_a = (float*)malloc(bytes);
+    float* h_b = (float*)malloc(bytes);
+    float* h_c = (float*)malloc(bytes);
+    for (int i = 0; i < N; i++) {
+        h_a[i] = 1.0f;
+        h_b[i] = 2.0f;
+    }
+
+    // 分配设备内存
+    float *d_a, *d_b, *d_c;
+    CUDA_CHECK(cudaMalloc(&d_a, bytes));
+    CUDA_CHECK(cudaMalloc(&d_b, bytes));
+    CUDA_CHECK(cudaMalloc(&d_c, bytes));
+
+    // Host → Device
+    CUDA_CHECK(cudaMemcpy(d_a, h_a, bytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b, h_b, bytes, cudaMemcpyHostToDevice));
+
+    // 计算 Grid 和 Block 维度
+    // Block大小指定为256
+    // N为线程总数
+    int blockSize = 256;
+    int gridSize = (N + blockSize - 1) / blockSize;
+
+    // 启动 Kernel
+    vectorAdd<<<gridSize, blockSize>>>(d_a, d_b, d_c, N);
+    CUDA_CHECK(cudaGetLastError());
+
+    // Device → Host
+    CUDA_CHECK(cudaMemcpy(h_c, d_c, bytes, cudaMemcpyDeviceToHost));
+
+    // 验证
+    for (int i = 0; i < N; i++) {
+        if (h_c[i] != 3.0f) {
+            printf("Error at index %d: %f\n", i, h_c[i]);
+            break;
+        }
+    }
+    printf("Vector addition completed successfully!\n");
+
+    // 释放
+    free(h_a); free(h_b); free(h_c);
+    cudaFree(d_a); cudaFree(d_b); cudaFree(d_c);
+    return 0;
+}
+```
+
 ## Reduce（并行归约）
 
 Reduce 是将一组数据聚合为一个值（如求和、求最大值）的操作。它是理解 CUDA 并行思维的最佳入门。
@@ -159,3 +232,168 @@ __global__ void gemmTiled(float* A, float* B, float* C,
     }
 }
 ```
+
+## Softmax
+
+### 朴素实现（两趟）
+
+```
+__global__ void softmaxNaive(float* input, float* output, int N) {
+    // 假设一个 Block 处理一行
+    __shared__ float smem[256];
+    int tid = threadIdx.x;
+
+    // 1. 求 max（Reduce 操作）
+    // we only get one block
+    float maxVal = -FLT_MAX;
+    for (int i = tid; i < N; i += blockDim.x) {
+        maxVal = fmaxf(maxVal, input[i]);
+    }
+    smem[tid] = maxVal;
+    __syncthreads();
+    
+    // Typical tree reduce for max in shared memory
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            smem[tid] = fmaxf(smem[tid], smem[tid + s]);
+        }
+        __syncthreads(); // Sync after each layer of the tree
+    }
+    float globalMax = smem[0];
+    __syncthreads();
+
+
+
+    // 2. 求 exp 之和（Reduce 操作）
+    float sumExp = 0.0f;
+    for (int i = tid; i < N; i += blockDim.x) {
+        sumExp += expf(input[i] - globalMax);
+    }
+    smem[tid] = sumExp;
+    __syncthreads();
+
+    for (int s = BLOCK_SIZE / 2; s > 0; s >>= 1)
+    {
+        if (tid < s)
+        {
+            smem[tid] = smem[tid] + smem[tid + s];
+        }
+        __syncthreads();
+    }
+
+    float globalSum = smem[0];
+    __syncthreads();
+
+    // 3. 计算 softmax
+    for (int i = tid; i < N; i += blockDim.x) {
+        output[i] = expf(input[i] - globalMax) / globalSum;
+    }
+}
+
+```
+
+### Online Softmax
+NVIDIA 提出的 Online Normalizer Calculation 方法，可以在一趟遍历中同时维护 max 和 sum，减少一次全局内存读取。
+
+```
+// 核心思想：在线更新 max 和 sum
+float m = -FLT_MAX;  // 当前 max
+float d = 0.0f;       // 当前 sum(exp(x - m))
+
+for (int i = tid; i < N; i += blockDim.x) {
+    float x = input[i];
+    float m_new = fmaxf(m, x);
+    // 关键：旧的 sum 需要用校正因子调整
+    d = d * expf(m - m_new) + expf(x - m_new);
+    m = m_new;
+}
+// 最终：softmax(x_i) = exp(x_i - m) / d
+
+```
+
+### 算子融合
+
+```
+未融合：
+kernel1: A = input + bias     → 写回 HBM
+kernel2: B = ReLU(A)          → 读 A 从 HBM，写 B 回 HBM
+kernel3: output = LayerNorm(B) → 读 B 从 HBM
+
+融合后：
+fused_kernel: output = LayerNorm(ReLU(input + bias))
+  → 只读一次 input，中间结果在寄存器/共享内存中流转
+```
+
+## Attention 算子
+
+标准 Attention 的计算公式,Attention logits matrix = QK⊤
+
+The size is 512GB.
+
+这远超单卡 80GB 显存。即使显存够用，反复在 HBM 和 SRAM 之间搬运这个巨大矩阵也会严重拖慢速度。
+
+### FlashAttention
+
+FlashAttention 的核心思想：通过 Tiling（分块）避免在 HBM 中存储完整的 QK^T 矩阵，将所有中间计算保持在 Shared Memory 中。
+
+
+FlashAttention：
+  对 Q 分块 → 每块与 K, V 的所有块做 Attention → 用 Online Softmax 拼接结果
+  ↑ 中间矩阵只在 SRAM 中，不写回 HBM
+
+Tiling：将 Q、K、V 分成小块，每块能装进 Shared Memory
+Online Softmax：在分块计算中正确维护 softmax 的全局 max 和 sum
+重计算（Recomputation）：反向传播时不存储中间 Attention 矩阵，而是重新计算（用计算换显存）
+
+## Triton
+
+Triton 是 OpenAI 开源的 GPU 编程语言，使用 Python 语法编写 GPU kernel，编译器自动处理内存合并、共享内存管理、Warp 调度等底层细节。
+
+Triton 的优势：
+Python 语法，学习曲线平缓
+编译器自动处理内存合并、共享内存 Tiling、Warp 调度
+性能可以达到手写 CUDA 的 80-95%
+FlashAttention 的原始实现就使用了 Triton
+
+```
+import triton
+import triton.language as tl
+import torch
+
+@triton.jit
+def add_kernel(
+    x_ptr, y_ptr, output_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    # 计算当前 Block 处理的元素范围
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+
+    # 加载、计算、存储
+    x = tl.load(x_ptr + offsets, mask=mask)
+    y = tl.load(y_ptr + offsets, mask=mask)
+    output = x + y
+    tl.store(output_ptr + offsets, output, mask=mask)
+
+# 调用
+def add(x: torch.Tensor, y: torch.Tensor):
+    output = torch.empty_like(x)
+    n = x.numel()
+    grid = lambda meta: (triton.cdiv(n, meta['BLOCK_SIZE']),)
+    add_kernel[grid](x, y, output, n, BLOCK_SIZE=1024)
+    return output
+
+# 使用
+x = torch.randn(1000000, device='cuda')
+y = torch.randn(1000000, device='cuda')
+result = add(x, y)
+
+```
+
+## 性能分析工具
+
+Nsight Compute（Kernel 级分析）
+Nsight Systems（系统级分析）
+编译器输出
