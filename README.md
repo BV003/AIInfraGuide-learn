@@ -1,8 +1,4 @@
 # AIinfraGuide
 
-This repo include documents about class standford_cs149, CUDA(Trition)(from AIInfraguide)
+This repo include documents from AIInfraguide and mini-sglang.
 
-## Structure
-
-CUDA.md
-Inference.md
